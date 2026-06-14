@@ -1,0 +1,10 @@
+title       = "trivia"
+baseURL     = "https://trivia-cli.tamnd.com/"
+description = "A command line for trivia."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/trivia-cli"
