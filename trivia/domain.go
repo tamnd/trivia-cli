@@ -1,14 +1,3 @@
-package trivia
-
-import (
-	"context"
-	"net/url"
-	"strings"
-
-	"github.com/tamnd/any-cli/kit"
-	"github.com/tamnd/any-cli/kit/errs"
-)
-
 // domain.go exposes trivia as a kit Domain: a driver that a multi-domain
 // host (ant) enables with a single blank import,
 //
@@ -17,11 +6,17 @@ import (
 // exactly as a database/sql program enables a driver with `import _
 // "github.com/lib/pq"`. The init below registers it; the host then dereferences
 // trivia:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone trivia binary (see cli.NewApp), so the
+// Domain also builds the standalone trivia binary (see cmd/trivia), so the
 // binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
+package trivia
+
+import (
+	"context"
+
+	"github.com/tamnd/any-cli/kit"
+	"github.com/tamnd/any-cli/kit/errs"
+)
+
 func init() { kit.Register(Domain{}) }
 
 // Domain is the trivia driver. It carries no state; the per-run client is
@@ -36,42 +31,36 @@ func (Domain) Info() kit.DomainInfo {
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "trivia",
-			Short:  "A command line for trivia.",
-			Long: `A command line for trivia.
+			Short:  "A command line for The Trivia API.",
+			Long: `trivia fetches random trivia questions from the-trivia-api.com.
 
-trivia reads public trivia data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+No API key required. Filter by category (science, history, music ...) and
+difficulty (easy, medium, hard). Questions come with the correct answer and
+three incorrect answers so you can build your own quiz logic on top.`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/trivia-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `trivia page` and
-	// `ant get trivia://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{
+		Name: "questions", Group: "read", List: true,
+		Summary: "Get random trivia questions",
+	}, getQuestions)
 
-	// List op: members of a page, the home of `trivia links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// trivia://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{
+		Name: "categories", Group: "read", List: true,
+		Summary: "List all available categories and their tags",
+	}, listCategories)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the client from the host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	c := DefaultConfig()
 	if cfg.UserAgent != "" {
 		c.UserAgent = cfg.UserAgent
 	}
@@ -82,92 +71,52 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 		c.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClient(c), nil
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Client *Client `kit:"inject"`
+type questionsInput struct {
+	Limit      int     `kit:"flag" help:"number of questions"`
+	Category   string  `kit:"flag" help:"category slug (e.g. science, history)"`
+	Difficulty string  `kit:"flag" help:"difficulty: easy, medium, or hard"`
+	Client     *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
+type categoriesInput struct {
 	Client *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
-	if err != nil {
-		return mapErr(err)
+func getQuestions(ctx context.Context, in questionsInput, emit func(*Question) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 10
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
+	qs, err := in.Client.Questions(ctx, limit, in.Category, in.Difficulty)
 	if err != nil {
-		return mapErr(err)
+		return errs.NotFound("%s", err.Error())
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for i := range qs {
+		if err := emit(&qs[i]); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full trivia.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized trivia reference: %q", input)
+func listCategories(ctx context.Context, in categoriesInput, emit func(*Category) error) error {
+	cats, err := in.Client.Categories(ctx)
+	if err != nil {
+		return errs.NotFound("%s", err.Error())
 	}
-	return "page", id, nil
-}
-
-// Locate is the inverse: the live https URL for a (type, id).
-func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
-		return "", errs.Usage("trivia has no resource type %q", uriType)
+	for i := range cats {
+		if err := emit(&cats[i]); err != nil {
+			return err
+		}
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
-}
-
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
-func mapErr(err error) error {
-	return err
+	return nil
 }

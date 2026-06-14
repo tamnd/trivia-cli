@@ -1,62 +1,157 @@
 // Package trivia is the library behind the trivia command line:
-// the HTTP client, request shaping, and the typed data models for trivia.
+// the HTTP client, request shaping, and typed data models for the-trivia-api.com.
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// The Client sets a real User-Agent, paces requests, and retries transient
+// failures (429 and 5xx) with exponential backoff. Two operations are provided:
+// get random trivia questions (Questions) and list all categories (Categories).
 package trivia
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
+	"net/url"
+	"sort"
+	"strconv"
+	"sync"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to trivia. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "trivia/dev (+https://github.com/tamnd/trivia-cli)"
+// Host is the site this client talks to.
+const Host = "the-trivia-api.com"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at trivia.com; change it once you
-// know the real endpoints you want to read.
-const Host = "trivia.com"
-
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
-
-// Client talks to trivia over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// Config holds tunable knobs for the HTTP client.
+type Config struct {
+	BaseURL   string
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
+	Rate      time.Duration
+	Timeout   time.Duration
+	Retries   int
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
+// DefaultConfig returns sensible defaults for production use.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   "https://the-trivia-api.com/v2",
+		UserAgent: "trivia-cli/0.1.0 (github.com/tamnd/trivia-cli)",
 		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Timeout:   30 * time.Second,
+		Retries:   3,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client talks to the-trivia-api.com over HTTP.
+type Client struct {
+	cfg  Config
+	http *http.Client
+	mu   sync.Mutex
+	last time.Time
+}
+
+// NewClient returns a Client configured with cfg.
+func NewClient(cfg Config) *Client {
+	return &Client{
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
+	}
+}
+
+// Question is one trivia question with its correct and incorrect answers.
+type Question struct {
+	ID               string   `json:"id"`
+	Category         string   `json:"category"`
+	Question         string   `json:"question"`
+	CorrectAnswer    string   `json:"correct_answer"`
+	IncorrectAnswers []string `json:"incorrect_answers"`
+	Difficulty       string   `json:"difficulty"`
+	Tags             []string `json:"tags"`
+	IsNiche          bool     `json:"is_niche"`
+}
+
+// Category groups a category name with its associated tags.
+type Category struct {
+	Name string   `json:"name"`
+	Tags []string `json:"tags"`
+}
+
+// wireQuestion matches the actual JSON shape returned by the API.
+type wireQuestion struct {
+	ID       string `json:"id"`
+	Category string `json:"category"`
+	Question struct {
+		Text string `json:"text"`
+	} `json:"question"`
+	CorrectAnswer    string   `json:"correctAnswer"`
+	IncorrectAnswers []string `json:"incorrectAnswers"`
+	Difficulty       string   `json:"difficulty"`
+	Tags             []string `json:"tags"`
+	IsNiche          bool     `json:"isNiche"`
+}
+
+// Questions returns random trivia questions with optional filters.
+// limit must be > 0; category and difficulty may be empty strings to omit the filter.
+func (c *Client) Questions(ctx context.Context, limit int, category, difficulty string) ([]Question, error) {
+	rawURL := c.cfg.BaseURL + "/questions?limit=" + strconv.Itoa(limit)
+	if category != "" {
+		rawURL += "&categories=" + url.QueryEscape(category)
+	}
+	if difficulty != "" {
+		rawURL += "&difficulty=" + url.QueryEscape(difficulty)
+	}
+
+	b, err := c.get(ctx, rawURL)
+	if err != nil {
+		return nil, err
+	}
+
+	var wires []wireQuestion
+	if err := json.Unmarshal(b, &wires); err != nil {
+		return nil, fmt.Errorf("decode questions: %w", err)
+	}
+
+	out := make([]Question, 0, len(wires))
+	for _, w := range wires {
+		out = append(out, Question{
+			ID:               w.ID,
+			Category:         w.Category,
+			Question:         w.Question.Text,
+			CorrectAnswer:    w.CorrectAnswer,
+			IncorrectAnswers: w.IncorrectAnswers,
+			Difficulty:       w.Difficulty,
+			Tags:             w.Tags,
+			IsNiche:          w.IsNiche,
+		})
+	}
+	return out, nil
+}
+
+// Categories returns all available categories with their tags, sorted by name.
+func (c *Client) Categories(ctx context.Context) ([]Category, error) {
+	rawURL := c.cfg.BaseURL + "/categories"
+	b, err := c.get(ctx, rawURL)
+	if err != nil {
+		return nil, err
+	}
+
+	var m map[string][]string
+	if err := json.Unmarshal(b, &m); err != nil {
+		return nil, fmt.Errorf("decode categories: %w", err)
+	}
+
+	out := make([]Category, 0, len(m))
+	for name, tags := range m {
+		out = append(out, Category{Name: name, Tags: tags})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+// get fetches url and returns the response body. It paces and retries.
+func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -64,7 +159,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,18 +168,18 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) ([]byte, bool, error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -106,10 +201,12 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 
 // pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
@@ -121,80 +218,4 @@ func backoff(attempt int) time.Duration {
 		d = 5 * time.Second
 	}
 	return d
-}
-
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on trivia.com. It is a stand-in for the typed records you
-// will model from the real trivia endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `trivia cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
 }
